@@ -9,7 +9,7 @@
 #include <netinet/if_ether.h>
 #include <netinet/in.h>
 #define FrameLen 14
-typedef unsigned long u_int32;
+typedef unsigned int u_int32;
 typedef unsigned short u_int16;
 typedef unsigned char u_int8;
 
