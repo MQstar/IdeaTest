@@ -1,14 +1,22 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <net/if.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <linux/if_packet.h>
-#include <netinet/in.h>
 #include <netinet/if_ether.h>
+#include <unistd.h>           // close()
+#include <string.h>           // strcpy, memset(), and memcpy()
+#include <netdb.h>            // struct addrinfo
+#include <sys/types.h>        // needed for socket(), uint8_t, uint16_t, uint32_t
+#include <sys/socket.h>       // needed for socket()
+#include <netinet/in.h>       // IPPROTO_UDP, INET_ADDRSTRLEN
+#include <arpa/inet.h>        // inet_pton() and inet_ntop()
+#include <sys/ioctl.h>        // macro ioctl is defined
+#include <bits/ioctls.h>      // defines values for argument "request" of ioctl.
+#include <net/if.h>           // struct ifreq
+#include <linux/if_ether.h>   // ETH_P_IP = 0x0800, ETH_P_IPV6 = 0x86DD
+#include <linux/if_packet.h>  // struct sockaddr_ll (see man 7 packet)
+#include <net/ethernet.h>
+#include <errno.h>            // errno, perror()
 #define ETHER_LEN 14
+#define IP4_LEN 20
 #define UDP_LEN 8
 #define GTP_LEN 8
 #define MAX_BUF_LEN 1024
@@ -74,9 +82,16 @@ int parseInt(char str[], int length)
     return number;
 }
 
-uint8_t* parseMac(char[] mac)
+uint8_t* parseMac(char mac[],char result[])
 {
-
+    uint8_t add[6];
+    sscanf(mac,"%2x:%2x:%2x:%2x:%2x:%2x",&add[0],&add[1],&add[2],&add[3],&add[4],&add[5]);
+    int i=0;
+    for(i=0;i<6;i++)
+    {
+        result[i]=add[i];
+    }
+    return result; 
 }
 
 int loadConfigDemo(const char* config_path)  
@@ -84,8 +99,8 @@ int loadConfigDemo(const char* config_path)
     FILE * file = fopen(config_path, "r");  
     if (file == NULL)  
     {  
-        printf("[Error]open %s failed.\n", config_path);  
-        return -1;  
+        printf("[Error]open %s failed.\n", config_path);
+        return -1;
     }
     int c=0;
     for(c=0;c<8;c++)
@@ -208,12 +223,36 @@ int IPFilter(IPHeader_t *ip)
     return 1;
 }
 
-int analyseIP(IPHeader_t *ip)
+uint16_t checksum (uint16_t *addr, int len)
 {
-    memcpy(&ip->SrcIP,&inet_addr(config[3]),sizeof (uint32_t));
-    memcpy(&ip->DstIP,&inet_addr(config[4]),sizeof (uint32_t));
-    memcpy(&ip->Checksum,,sizeof (uint16_t));//TODO
-    return 0;
+  int nleft = len;
+  int sum = 0;
+  uint16_t *w = addr;
+  uint16_t answer = 0;
+
+  while (nleft > 1) {
+    sum += *w++;
+    nleft -= sizeof (uint16_t);
+  }
+
+  if (nleft == 1) {
+    *(uint8_t *) (&answer) = *(uint8_t *) w;
+    sum += answer;
+  }
+  sum = (sum >> 16) + (sum & 0xFFFF);
+  sum += (sum >> 16);
+  answer = ~sum;
+  return (answer);
+}
+
+uint16_t analyseIP(IPHeader_t *ip)
+{
+    ip->SrcIP=inet_addr(config[3]);
+    ip->DstIP=inet_addr(config[4]);
+    ip->Checksum=0;
+    ip->Checksum=checksum((uint16_t *)&ip,IP4_LEN);//TODO
+    int length = ((*((uint8_t*)ip+2)<<8)+*((uint8_t*)ip+3));
+    return length;
 }
 
 
@@ -222,13 +261,14 @@ int main()
 {  
     loadConfigDemo("./setting.conf");
     struct ifreq m_ifreq;
-    int sock = 0;
+    int sd,frame_length,bytes,sock = 0;
     sock = socket(AF_INET,SOCK_STREAM,0);
     strcpy(m_ifreq.ifr_name,config[7]);
     ioctl(sock,SIOCGIFHWADDR,&m_ifreq);
     uint8_t* mac=(uint8_t*)m_ifreq.ifr_hwaddr.sa_data;
     EtherHeader_t *ether;
     char buf[12000];//1500 MTU
+    uint8_t srcmac[6], dstmac[6];
     ssize_t n;
     /* capture ip datagram without ethernet header */
     if ((sock = socket(PF_PACKET,  SOCK_RAW, htons(ETH_P_ALL)))== -1)
@@ -247,8 +287,8 @@ int main()
         else if (n==0)
             continue;
         ether = (EtherHeader_t *)(buf);
-        if(EtherFilter(ether,mac)==1)
-            continue;
+       // if(EtherFilter(ether,mac)==1)
+       //     continue;
         IPHeader_t *ip = ( IPHeader_t *)(buf + ETHER_LEN);
         if(IPFilter(ip)==1)
             continue;
@@ -257,49 +297,58 @@ int main()
         IPHeader_t *payload = (IPHeader_t *)(buf + ETHER_LEN + iplen + UDP_LEN + GTP_LEN);
         //generate ether header
         int datalen=analyseIP(payload);//modify ip in header and get length
+        printf("length %d\n",datalen);
+        if (datalen>1500)
+            continue;
+        // Find interface index from interface name and store index in
+        // struct sockaddr_ll device, which will be used as an argument of sendto().
+        struct sockaddr_ll device;
+        memset (&device, 0, sizeof (device));
+        if ((device.sll_ifindex = if_nametoindex (config[7])) == 0)
+        {
+            perror ("if_nametoindex() failed to obtain interface index ");
+            exit (EXIT_FAILURE);
+        } 
+        // Fill out sockaddr_ll.
+        device.sll_family = AF_PACKET;
+        memcpy (device.sll_addr, parseMac(config[5],srcmac), 6 * sizeof (uint8_t));
+        device.sll_halen = htons (6);
+        uint8_t *ether_frame;
+        ether_frame=(uint8_t *) malloc (1500 * sizeof (uint8_t));
+        frame_length = 6 + 6 + 2 + datalen;
+        memcpy (ether_frame, parseMac(config[6],dstmac), 6 * sizeof (uint8_t));
+        //printf("new dstmac %x:%x:%x:%x:%x:%x\n",dstmac[0],dstmac[1],dstmac[2],dstmac[3],dstmac[4],dstmac[5]);
+        memcpy (ether_frame + 6, parseMac(config[5],srcmac), 6 * sizeof (uint8_t));
+        //printf("new srcmac %x:%x:%x:%x:%x:%x\n",srcmac[0],srcmac[1],srcmac[2],srcmac[3],srcmac[4],srcmac[5]);
+        ether_frame[12] = ETH_P_IP / 256;
+        ether_frame[13] = ETH_P_IP % 256;
+        //!!!POINT
+        memcpy(ether_frame+ETHER_LEN,payload,datalen * sizeof (uint8_t));
+
+
+//        int n=0;
+//        for(n=0;n<frame_length;n++)
+//        {
+//            printf("%02x ",ether_frame[n]);
+//        }
 
 
 
 
-// Find interface index from interface name and store index in
-// struct sockaddr_ll device, which will be used as an argument of sendto().
-struct sockaddr_ll device;
-memset (&device, 0, sizeof (device));  
-  if ((device.sll_ifindex = if_nametoindex (config[7])) == 0) {  
-    perror ("if_nametoindex() failed to obtain interface index ");  
-    exit (EXIT_FAILURE);  
-  } 
-
-// Fill out sockaddr_ll.  
-  device.sll_family = AF_PACKET;  
-  memcpy (device.sll_addr, parseMac(config[5]), 6 * sizeof (uint8_t));  
-  device.sll_halen = htons (6);
-
-
-
-
-
-memcpy (ether_frame, parseMac(config[6]), 6 * sizeof (uint8_t));  
-memcpy (ether_frame + 6, parseMac(config[5]), 6 * sizeof (uint8_t));
-ether_frame[12] = ETH_P_IP / 256;  
-ether_frame[13] = ETH_P_IP % 256;
-//!!!POINT
-memcpy(ether_frame+ETHER_LEN,payload,datalen * sizeof (uint8_t))
-
-if ((sd = socket (PF_PACKET, SOCK_RAW, htons (ETH_P_ALL))) < 0) {  
-    perror ("socket() failed ");  
-    exit (EXIT_FAILURE);  
-  }  
-      // Send ethernet frame to socket.  
-      if ((bytes = sendto (sd, ether_frame, frame_length, 0, (struct sockaddr *) &device, sizeof (device))) <= 0) {  
-        perror ("sendto() failed");  
-        exit (EXIT_FAILURE);  
-      }
-
-
-
-
+        if ((sd = socket (PF_PACKET, SOCK_RAW, htons (ETH_P_ALL))) < 0) 
+        {
+            perror ("socket() failed ");
+            exit (EXIT_FAILURE);
+        }
+        // Send ethernet frame to socket.
+        if ((bytes = sendto (sd, ether_frame, frame_length, 0, (struct sockaddr *) &device, sizeof (device))) <= 0) 
+        {
+            perror ("sendto() failed");
+            exit (EXIT_FAILURE);
+        }
+        close(sd);
+        free (ether_frame);
+        printf("done\n");
     }
-    close(sock);
     return 0;
 }
